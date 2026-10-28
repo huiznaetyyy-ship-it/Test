@@ -1,7 +1,7 @@
 const http = require('http');
 const https = require('https');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
     // 1. Inject relaxed CORS headers allowing JanitorAI to talk to it
