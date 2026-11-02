@@ -4,19 +4,17 @@ const https = require('https');
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
-  // 1. Устанавливаем НАШИ CORS-заголовки, чтобы избежать дублирования
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  // 2. Немедленно отвечаем на preflight-запросы браузера
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
   }
 
-  // 3. Перезаписываем путь: JanitorAI -> /chat/completions, APInex -> /v1/chat/completions
+  // Перезапись пути для APInex
   let targetPath = req.url;
   if (targetPath === '/chat/completions') {
     targetPath = '/v1/chat/completions';
@@ -24,7 +22,7 @@ const server = http.createServer((req, res) => {
 
   const options = {
     hostname: 'api.apinex.bond',
-    path: targetPath, // Используем исправленный путь
+    path: targetPath,
     method: req.method,
     headers: {
       ...req.headers,
@@ -33,8 +31,7 @@ const server = http.createServer((req, res) => {
   };
 
   const proxyReq = https.request(options, (proxyRes) => {
-    // 4. Копируем заголовки от APInex, но УДАЛЯЕМ его CORS-заголовки,
-    //    чтобы не дублировать наши собственные.
+    // Копируем заголовки, удаляя CORS-дубликаты
     const headers = { ...proxyRes.headers };
     delete headers['access-control-allow-origin'];
     delete headers['access-control-allow-methods'];
@@ -42,35 +39,18 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(proxyRes.statusCode, headers);
 
-    // 5. Обрабатываем поток SSE, чтобы отфильтровать служебные строки
     const contentType = proxyRes.headers['content-type'] || '';
-    if (contentType.includes('text/event-stream')) {
-      let buffer = '';
-      proxyRes.on('data', (chunk) => {
-        buffer += chunk.toString();
-        // Обрабатываем поток построчно
-        let lines = buffer.split('\n');
-        buffer = lines.pop(); // Оставляем последнюю неполную строку в буфере
+    const isSSE = contentType.includes('text/event-stream');
 
-        lines.forEach((line) => {
-          // Пропускаем пустые строки и служебные комментарии SSE (начинаются с ":")
-          if (line.trim() !== '' && !line.startsWith(':')) {
-            res.write(line + '\n');
-          }
-        });
-      });
-
-      proxyRes.on('end', () => {
-        // Отправляем оставшийся буфер, если он есть, и завершаем поток
-        if (buffer.trim() !== '' && !buffer.startsWith(':')) {
-          res.write(buffer + '\n');
-        }
-        res.end();
-      });
-    } else {
-      // Если ответ не потоковый, просто передаем его как есть
-      proxyRes.pipe(res);
+    if (isSSE) {
+      // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: немедленно отправляем заголовки,
+      // чтобы браузер не решил, что соединение не установлено.
+      res.flushHeaders();
     }
+
+    // Просто передаём поток как есть. SSE-комментарии (`: ping`)
+    // JanitorAI умеет игнорировать, а ручная фильтрация только ломает формат.
+    proxyRes.pipe(res);
   });
 
   proxyReq.on('error', (err) => {
@@ -81,7 +61,6 @@ const server = http.createServer((req, res) => {
     res.end('Proxy Error: ' + err.message);
   });
 
-  // Передаем тело исходного запроса в прокси-запрос
   req.pipe(proxyReq);
 });
 
