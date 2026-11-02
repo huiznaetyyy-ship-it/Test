@@ -4,7 +4,7 @@ const https = require('https');
 const PORT = process.env.PORT || 3000;
 
 const server = http.createServer((req, res) => {
-  // CORS заголовки
+  // 1. CORS-заголовки для нашего прокси
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -15,7 +15,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Перезапись пути для APInex
+  // 2. Перезапись пути для APInex
   let targetPath = req.url;
   if (targetPath === '/chat/completions') {
     targetPath = '/v1/chat/completions';
@@ -32,20 +32,27 @@ const server = http.createServer((req, res) => {
   };
 
   const proxyReq = https.request(options, (proxyRes) => {
-    // Копируем заголовки, удаляя CORS-дубликаты
+    // 3. Копируем заголовки от APInex, УДАЛЯЯ его CORS-заголовки,
+    //    чтобы избежать дублирования с нашими.
     const headers = { ...proxyRes.headers };
     delete headers['access-control-allow-origin'];
     delete headers['access-control-allow-methods'];
     delete headers['access-control-allow-headers'];
 
+    // 4. Отправляем заголовки клиенту
     res.writeHead(proxyRes.statusCode, headers);
 
     const contentType = proxyRes.headers['content-type'] || '';
     const isSSE = contentType.includes('text/event-stream');
 
     if (isSSE) {
-      // Немедленно отправляем заголовки для потоковой передачи
+      // 5. КРИТИЧЕСКИ ВАЖНО: немедленно отправляем заголовки в сокет.
+      //    Это предотвращает "Network error" из-за таймаута.
       res.flushHeaders();
+
+      // 6. Отправляем начальный комментарий, чтобы некоторые прокси
+      //    немедленно начали передачу потока, не дожидаясь данных.
+      res.write(': stream-start\n\n');
 
       let buffer = '';
 
@@ -61,11 +68,9 @@ const server = http.createServer((req, res) => {
             return;
           }
 
-          // Обрабатываем строки с данными
           if (trimmed.startsWith('data: ')) {
-            const jsonStr = trimmed.slice(6); // Убираем "data: "
-            
-            // Проверяем, не является ли это сигналом завершения
+            const jsonStr = trimmed.slice(6);
+            // Проверяем на сигнал завершения
             if (jsonStr === '[DONE]') {
               res.write(line + '\n\n');
               return;
@@ -74,37 +79,30 @@ const server = http.createServer((req, res) => {
             try {
               const data = JSON.parse(jsonStr);
               
-              // ПРОВЕРЯЕМ НАЛИЧИЕ reasoning_content В ДЕЛЬТЕ
+              // 7. Обрабатываем reasoning_content в потоке
               if (data.choices && data.choices[0] && data.choices[0].delta) {
                 const delta = data.choices[0].delta;
-                
-                // Если есть reasoning_content, оборачиваем его в теги <thinking>
                 if (delta.reasoning_content) {
-                  const thinkingText = delta.reasoning_content;
-                  
-                  // Модифицируем delta: переносим reasoning_content в content с тегами
-                  delta.content = `<thinking>${thinkingText}</thinking>`;
-                  // Удаляем оригинальное поле, чтобы избежать дублирования
+                  // Оборачиваем в ПРАВИЛЬНЫЕ теги <think>
+                  delta.content = `<think>${delta.reasoning_content}</think>`;
                   delete delta.reasoning_content;
                 }
               }
               
-              // Отправляем модифицированные данные
+              // Отправляем модифицированные данные как корректное SSE-событие
               res.write(`data: ${JSON.stringify(data)}\n\n`);
-              
             } catch (e) {
               // Если не удалось распарсить, отправляем как есть
               res.write(line + '\n\n');
             }
           } else {
-            // Другие строки отправляем как есть
+            // Другие строки (например, event:, id:) отправляем как есть
             res.write(line + '\n\n');
           }
         });
       });
 
       proxyRes.on('end', () => {
-        // Обрабатываем оставшийся буфер
         if (buffer.trim()) {
           res.write(buffer + '\n');
         }
@@ -112,35 +110,26 @@ const server = http.createServer((req, res) => {
       });
 
     } else {
-      // ДЛЯ НЕСТРИМИНГОВЫХ ОТВЕТОВ (обычный JSON)
+      // 8. Обработка НЕ-потоковых (обычных JSON) ответов
       let body = '';
-      
       proxyRes.on('data', (chunk) => {
         body += chunk.toString('utf8');
       });
-      
       proxyRes.on('end', () => {
         try {
           const data = JSON.parse(body);
           
-          // Проверяем наличие reasoning_content в ответе
+          // Обрабатываем reasoning_content в обычном ответе
           if (data.choices && data.choices[0] && data.choices[0].message) {
             const message = data.choices[0].message;
-            
-            // Если есть reasoning_content и нет content, или reasoning_content нужно объединить
             if (message.reasoning_content) {
               const thinkingText = message.reasoning_content;
-              
-              // Оборачиваем в теги и добавляем в content
+              // Оборачиваем в ПРАВИЛЬНЫЕ теги <think> и объединяем с контентом
               if (message.content) {
-                // Если content уже есть, добавляем размышления перед ним
-                message.content = `<thinking>${thinkingText}</thinking>\n${message.content}`;
+                message.content = `<think>${thinkingText}</think>\n${message.content}`;
               } else {
-                // Если content пуст, он становится размышлениями
-                message.content = `<thinking>${thinkingText}</thinking>`;
+                message.content = `<think>${thinkingText}</think>`;
               }
-              
-              // Удаляем оригинальное поле
               delete message.reasoning_content;
             }
           }
